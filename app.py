@@ -1,57 +1,32 @@
-from flask import Flask, Response, jsonify
-from flask_sqlalchemy import SQLAlchemy
-from flask_cors import CORS
-from flask_socketio import SocketIO
-from ultralytics import YOLO
-from sort import Sort
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi_sqlalchemy import DBSessionMiddleware, db
+from sqlalchemy import Column, Integer, Date, Time
+from sqlalchemy.orm import declarative_base
+from pydantic import BaseModel
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime, time as dt_time
 import cv2
 import numpy as np
 import os
+from ultralytics import YOLO
+from sort import Sort
+import asyncio
 
-app = Flask(__name__)
+app = FastAPI()
+app.add_middleware(DBSessionMiddleware, db_url=os.getenv("DATABASE_URL"))
 
-# Database configuration (replace with your PostgreSQL credentials)
-app.config['SQLALCHEMY_DATABASE_URI'] = 'postgresql://postgres:1234@localhost/rizfirman'
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-db = SQLAlchemy(app)
+# Database setup
+Base = declarative_base()
 
-# Enable CORS for all routes
-CORS(app)
-
-# Initialize SocketIO
-socketio = SocketIO(app, cors_allowed_origins="*")
-
-# Set resolution for video capture
-desired_width = 640
-desired_height = 480
-
-# Load YOLO model
-model = YOLO('yolov8n.pt')
-
-# Array of RTSP stream URLs
-cctv_urls = [
-  os.getenv('RSTP_LINK_1'),
-    os.getenv('RSTP_LINK_2'),
-]
-
-# Initialize SORT tracker for each stream
-trackers = [Sort() for _ in cctv_urls]
-
-# Initialize daily count for each stream
-total_counts = [0 for _ in cctv_urls]  # Start with zero for each stream
-current_date = datetime.now().date()   # Variable to track current date
-
-# Model for storing visitor counts with specific time of detection
-class VisitorCount(db.Model):
+class VisitorCount(Base):
     __tablename__ = 'visitor_count'
-    id = db.Column(db.Integer, primary_key=True)
-    date = db.Column(db.Date, nullable=False)              # Store date in yyyy-mm-dd format
-    stream_id = db.Column(db.Integer, nullable=False)
-    time = db.Column(db.Time, nullable=False)               # Store exact time of entry in hh:mm:ss format
-    accumulation_count_per_day = db.Column(db.Integer, nullable=False, default=0)  # Daily cumulative count
-    realtime_count = db.Column(db.Integer, nullable=False)  # Count at the exact time of detection
+    id = Column(Integer, primary_key=True)
+    date = Column(Date, nullable=False)
+    stream_id = Column(Integer, nullable=False)
+    time = Column(Time, nullable=False)
+    accumulation_count_per_day = Column(Integer, nullable=False, default=0)
+    realtime_count = Column(Integer, nullable=False)
 
     def __init__(self, date, stream_id, time, accumulation_count_per_day, realtime_count):
         self.date = date
@@ -60,106 +35,77 @@ class VisitorCount(db.Model):
         self.accumulation_count_per_day = accumulation_count_per_day
         self.realtime_count = realtime_count
 
-# Function to initialize total counts from the database
+# Initialize YOLO and video streams
+desired_width, desired_height = 640, 480
+model = YOLO("yolov8n.pt")
+cctv_urls = [os.getenv("RSTP_LINK_1"), os.getenv("RSTP_LINK_2")]
+trackers = [Sort() for _ in cctv_urls]
+total_counts = [0 for _ in cctv_urls]
+current_date = datetime.now().date()
+
+# Functions for database operations
 def initialize_total_counts():
     global total_counts
     today = datetime.now().date()
+    session = db.session
     for i in range(len(cctv_urls)):
-        # Get the last accumulation_count_per_day for today for each stream
-        last_record = VisitorCount.query.filter_by(date=today, stream_id=i + 1).order_by(VisitorCount.id.desc()).first()
+        last_record = session.query(VisitorCount).filter_by(date=today, stream_id=i + 1).order_by(VisitorCount.id.desc()).first()
         total_counts[i] = last_record.accumulation_count_per_day if last_record else 0
 
-# Create the tables in the database and initialize total counts
-with app.app_context():
-    db.create_all()
-    initialize_total_counts()
-
-# Function to save each detection to the database and update the daily cumulative count
-def save_entry_to_db(stream_id):
+async def save_entry_to_db(stream_id):
     try:
-        with app.app_context():
-            now = datetime.now()
-            current_date = now.date()
-            exact_time = dt_time(now.hour, now.minute, now.second)  # Exact time in hh:mm:ss
+        now = datetime.now()
+        session = db.session
+        current_date = now.date()
+        exact_time = dt_time(now.hour, now.minute, now.second)
 
-            # Retrieve the last entry to get the latest daily cumulative count
-            last_record = VisitorCount.query.filter_by(date=current_date, stream_id=stream_id).order_by(VisitorCount.id.desc()).first()
-            
-            # If new day, reset accumulation count; otherwise, increment
-            current_count = last_record.accumulation_count_per_day + 1 if last_record else 1
+        last_record = session.query(VisitorCount).filter_by(date=current_date, stream_id=stream_id).order_by(VisitorCount.id.desc()).first()
+        current_count = last_record.accumulation_count_per_day + 1 if last_record else 1
 
-            # Add new entry with specific detection time, updated cumulative count, and real-time count (1 per detection)
-            new_entry = VisitorCount(
-                date=current_date,
-                stream_id=stream_id,
-                time=exact_time,
-                accumulation_count_per_day=current_count,
-                realtime_count=1
-            )
-            db.session.add(new_entry)
-            db.session.commit()
-            print(f"New entry added: Stream {stream_id}, Date: {current_date}, Time: {exact_time}, Daily Accumulation: {current_count}")
+        new_entry = VisitorCount(date=current_date, stream_id=stream_id, time=exact_time, accumulation_count_per_day=current_count, realtime_count=1)
+        session.add(new_entry)
+        session.commit()
     except Exception as e:
-        db.session.rollback()
+        session.rollback()
         print(f"Error while saving entry to DB: {e}")
 
-# Reset daily counts at midnight for each stream
+# Reset daily counts at midnight
 def reset_daily_counts():
     global total_counts, current_date
-    current_date = datetime.now().date()  # Perbarui tanggal
-    total_counts = [0 for _ in cctv_urls]  # Reset total counts ke 0
-    
-    # Reset accumulation_count_per_day di database
-    with app.app_context():
-        for stream_id in range(1, len(cctv_urls) + 1):
-            new_entry = VisitorCount(
-                date=current_date,
-                stream_id=stream_id,
-                time=dt_time(0, 0, 0),
-                accumulation_count_per_day=0,
-                realtime_count=0
-            )
-            db.session.add(new_entry)
-        db.session.commit()
-    
-    print("Daily counts and database accumulation counts reset at midnight.")
+    current_date = datetime.now().date()
+    total_counts = [0 for _ in cctv_urls]
+    session = db.session
+    for stream_id in range(1, len(cctv_urls) + 1):
+        new_entry = VisitorCount(date=current_date, stream_id=stream_id, time=dt_time(0, 0, 0), accumulation_count_per_day=0, realtime_count=0)
+        session.add(new_entry)
+    session.commit()
 
-# Scheduler to reset counts daily at midnight
 scheduler = BackgroundScheduler()
-scheduler.add_job(func=reset_daily_counts, trigger='cron', hour=0, minute=0)
+scheduler.add_job(reset_daily_counts, "cron", hour=0, minute=0)
 scheduler.start()
 
-def generate_frames(url_index):
+# Video streaming and object detection
+async def generate_frames(url_index: int):
     global total_counts, current_date
     cap = cv2.VideoCapture(cctv_urls[url_index])
-
     if not cap.isOpened():
-        print(f"Error: Could not open video source: {cctv_urls[url_index]}")
-        return None
+        raise HTTPException(status_code=404, detail="Could not open video source")
 
     counted_ids = set()
     tracker = trackers[url_index]
 
     while True:
-        # Cek apakah hari telah berganti
-        now = datetime.now().date()
-        if now != current_date:
-            # Jika hari berganti, reset total counts dan update dari database
+        if datetime.now().date() != current_date:
             reset_daily_counts()
-            initialize_total_counts()  # Ambil data akumulasi terbaru dari database
+            initialize_total_counts()
 
         ret, frame = cap.read()
         if not ret:
-            print(f"Error: Could not read frame from video source: {cctv_urls[url_index]}")
             break
 
         frame = cv2.resize(frame, (desired_width, desired_height))
-
-        # Perform object detection
         results = model(frame, conf=0.25)
         detections = results[0].boxes.data.cpu().numpy()
-
-        line_position = frame.shape[0] // 2
 
         sort_input = []
         for det in detections:
@@ -169,62 +115,40 @@ def generate_frames(url_index):
                 if cls is None or int(cls) == 0:
                     sort_input.append([x1, y1, x2, y2, conf])
 
-        sort_input = np.array(sort_input)
-
-        if sort_input.size > 0:
-            tracked_objects = tracker.update(sort_input)
+        if sort_input:
+            tracked_objects = tracker.update(np.array(sort_input))
             for obj in tracked_objects:
                 x1, y1, x2, y2, obj_id = obj
-                center_y = int((y1 + y2) / 2)
+                if int(obj_id) not in counted_ids:
+                    counted_ids.add(int(obj_id))
+                    total_counts[url_index] += 1
+                    await save_entry_to_db(stream_id=url_index + 1)
 
-                cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
-
-                if center_y > line_position - 10 and center_y < line_position + 10:
-                    if int(obj_id) not in counted_ids:
-                        counted_ids.add(int(obj_id))
-                        total_counts[url_index] += 1
-                        print(f"Stream {url_index + 1} Daily count: {total_counts[url_index]}")
-
-                        # Emit updated count and time to WebSocket clients
-                        socketio.emit('update_count', {
-                            'stream_id': url_index + 1,
-                            'totalCount': total_counts[url_index],
-                            'timestamp': datetime.now().strftime("%H:%M")
-                        })
-
-                        # Save entry to database with exact time, updated cumulative count, and real-time count
-                        save_entry_to_db(stream_id=url_index + 1)
-
-        cv2.line(frame, (0, line_position), (frame.shape[1], line_position), (255, 0, 0), 2)
-        cv2.putText(frame, f'Count: {total_counts[url_index]}', (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-
-        ret, buffer = cv2.imencode('.jpg', frame)
+        ret, buffer = cv2.imencode(".jpg", frame)
         frame = buffer.tobytes()
+        yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
 
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-
-@app.route('/video_feed/<int:url_index>')
-def video_feed(url_index):
+@app.get("/video_feed/{url_index}")
+async def video_feed(url_index: int):
     if 0 <= url_index < len(cctv_urls):
-        return Response(generate_frames(url_index), mimetype='multipart/x-mixed-replace; boundary=frame')
+        return StreamingResponse(generate_frames(url_index), media_type="multipart/x-mixed-replace; boundary=frame")
     else:
-        return f"Error: Invalid stream index {url_index}", 400
+        raise HTTPException(status_code=400, detail="Invalid stream index")
 
-@app.route('/cctv_links')
-def get_cctv_links():
-    data = []
-    for i, url in enumerate(cctv_urls):
-        data.append({
-            "id": i + 1,
-            "link": f"/video_feed/{i}",
-            "totalCount": total_counts[i]
-        })
-    return jsonify({"data": data})
+@app.get("/cctv_links")
+async def get_cctv_links():
+    data = [{"id": i + 1, "link": f"/video_feed/{i}", "totalCount": total_counts[i]} for i in range(len(cctv_urls))]
+    return JSONResponse(content={"data": data})
 
-@socketio.on('connect')
-def handle_connect():
-    print('Client connected')
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        while True:
+            for i, count in enumerate(total_counts):
+                await websocket.send_json({"stream_id": i + 1, "totalCount": count, "timestamp": datetime.now().strftime("%H:%M")})
+            await asyncio.sleep(1)
+    except WebSocketDisconnect:
+        print("Client disconnected")
 
-if __name__ == "__main__":
-    socketio.run(app, host='0.0.0.0', port=9000, debug=True)
+# Run the app with: uvicorn main:app --host 0.0.0.0 --port 9000

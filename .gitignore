@@ -3,4 +3,8 @@
 .env
 .env.*
 !.env.example
+venv
 yolov8n.pt
+# Ignore Python bytecode
+__pycache__/
+*.py[cod]  # Optional: ignore Python bytecode files
