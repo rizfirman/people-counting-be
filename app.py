@@ -32,15 +32,16 @@ model = YOLO('yolov8n.pt')
 
 # Array of RTSP stream URLs
 cctv_urls = [
-  os.getenv('RSTP_LINK_1'),
-    os.getenv('RSTP_LINK_2'),
+   os.getenv('RSTP_LINK_1'),
+  os.getenv('RSTP_LINK_2'),
 ]
 
 # Initialize SORT tracker for each stream
 trackers = [Sort() for _ in cctv_urls]
 
-# Initialize daily count for each stream
+# Initialize daily count and last time for each stream
 total_counts = [0 for _ in cctv_urls]  # Start with zero for each stream
+last_time = [None for _ in cctv_urls]  # Last time for each stream
 current_date = datetime.now().date()   # Variable to track current date
 
 # Model for storing visitor counts with specific time of detection
@@ -60,21 +61,53 @@ class VisitorCount(db.Model):
         self.accumulation_count_per_day = accumulation_count_per_day
         self.realtime_count = realtime_count
 
-# Function to initialize total counts from the database
+# Function to initialize total counts and last time from the database
 def initialize_total_counts():
-    global total_counts
+    global total_counts, last_time
     today = datetime.now().date()
     for i in range(len(cctv_urls)):
-        # Get the last accumulation_count_per_day for today for each stream
+        # Get the last record for today for each stream
         last_record = VisitorCount.query.filter_by(date=today, stream_id=i + 1).order_by(VisitorCount.id.desc()).first()
         total_counts[i] = last_record.accumulation_count_per_day if last_record else 0
+        last_time[i] = last_record.time if last_record else None  # Store the last detection time
 
-# Create the tables in the database and initialize total counts
+# Create the tables in the database and initialize total counts and last time
 with app.app_context():
     db.create_all()
     initialize_total_counts()
 
 # Function to save each detection to the database and update the daily cumulative count
+# def save_entry_to_db(stream_id):
+#     try:
+#         with app.app_context():
+#             now = datetime.now()
+#             current_date = now.date()
+#             exact_time = dt_time(now.hour, now.minute, now.second)  # Exact time in hh:mm:ss
+
+#             # Retrieve the last entry to get the latest daily cumulative count
+#             last_record = VisitorCount.query.filter_by(date=current_date, stream_id=stream_id).order_by(VisitorCount.id.desc()).first()
+            
+#             # If new day, reset accumulation count; otherwise, increment
+#             current_count = last_record.accumulation_count_per_day + 1 if last_record else 1
+
+#             # Add new entry with specific detection time, updated cumulative count, and real-time count (1 per detection)
+#             new_entry = VisitorCount(
+#                 date=current_date,
+#                 stream_id=stream_id,
+#                 time=exact_time,
+#                 accumulation_count_per_day=current_count,
+#                 realtime_count=1
+#             )
+#             db.session.add(new_entry)
+#             db.session.commit()
+
+#             # Update last_time for the stream after saving
+#             last_time[stream_id - 1] = exact_time  # Update the last time for the stream
+#             print(f"New entry added: Stream {stream_id}, Date: {current_date}, Time: {exact_time}, Daily Accumulation: {current_count}")
+#     except Exception as e:
+#         db.session.rollback()
+#         print(f"Error while saving entry to DB: {e}")
+
 def save_entry_to_db(stream_id):
     try:
         with app.app_context():
@@ -82,26 +115,50 @@ def save_entry_to_db(stream_id):
             current_date = now.date()
             exact_time = dt_time(now.hour, now.minute, now.second)  # Exact time in hh:mm:ss
 
-            # Retrieve the last entry to get the latest daily cumulative count
-            last_record = VisitorCount.query.filter_by(date=current_date, stream_id=stream_id).order_by(VisitorCount.id.desc()).first()
-            
-            # If new day, reset accumulation count; otherwise, increment
-            current_count = last_record.accumulation_count_per_day + 1 if last_record else 1
-
-            # Add new entry with specific detection time, updated cumulative count, and real-time count (1 per detection)
-            new_entry = VisitorCount(
+            # Check for existing entry with the same date, stream_id, and exact time
+            existing_record = VisitorCount.query.filter_by(
                 date=current_date,
                 stream_id=stream_id,
-                time=exact_time,
-                accumulation_count_per_day=current_count,
-                realtime_count=1
-            )
-            db.session.add(new_entry)
-            db.session.commit()
-            print(f"New entry added: Stream {stream_id}, Date: {current_date}, Time: {exact_time}, Daily Accumulation: {current_count}")
+                time=exact_time
+            ).first()
+
+            if existing_record:
+                # If an entry exists at the same time, increment the realtime_count
+                existing_record.realtime_count += 1
+                existing_record.accumulation_count_per_day += 1
+                db.session.commit()
+                print(f"Updated entry: Stream {stream_id}, Date: {current_date}, Time: {exact_time}, "
+                      f"Daily Accumulation: {existing_record.accumulation_count_per_day}, "
+                      f"Realtime Count: {existing_record.realtime_count}")
+                
+                # Update last_time for the stream after updating the existing record
+                last_time[stream_id - 1] = exact_time
+
+            else:
+                # If no entry exists, create a new one with realtime_count set to 1
+                # Retrieve the last entry to get the latest daily cumulative count
+                last_record = VisitorCount.query.filter_by(date=current_date, stream_id=stream_id).order_by(VisitorCount.id.desc()).first()
+                current_count = last_record.accumulation_count_per_day + 1 if last_record else 1
+
+                # Add new entry with specific detection time, updated cumulative count, and real-time count (1 per detection)
+                new_entry = VisitorCount(
+                    date=current_date,
+                    stream_id=stream_id,
+                    time=exact_time,
+                    accumulation_count_per_day=current_count,
+                    realtime_count=1
+                )
+                db.session.add(new_entry)
+                db.session.commit()
+
+                # Update last_time for the stream after saving
+                last_time[stream_id - 1] = exact_time  # Update the last time for the stream
+                print(f"New entry added: Stream {stream_id}, Date: {current_date}, Time: {exact_time}, "
+                      f"Daily Accumulation: {current_count}, Realtime Count: 1")
     except Exception as e:
         db.session.rollback()
         print(f"Error while saving entry to DB: {e}")
+
 
 # Reset daily counts at midnight for each stream
 def reset_daily_counts():
@@ -184,16 +241,16 @@ def generate_frames(url_index):
                         counted_ids.add(int(obj_id))
                         total_counts[url_index] += 1
                         print(f"Stream {url_index + 1} Daily count: {total_counts[url_index]}")
+                        
+                        # Save entry to database with exact time, updated cumulative count, and real-time count
+                        save_entry_to_db(stream_id=url_index + 1)
 
                         # Emit updated count and time to WebSocket clients
                         socketio.emit('update_count', {
                             'stream_id': url_index + 1,
                             'totalCount': total_counts[url_index],
-                            'timestamp': datetime.now().strftime("%H:%M")
+                            'timestamp': last_time[url_index].strftime("%H:%M:%S") if last_time[url_index] else "N/A"
                         })
-
-                        # Save entry to database with exact time, updated cumulative count, and real-time count
-                        save_entry_to_db(stream_id=url_index + 1)
 
         cv2.line(frame, (0, line_position), (frame.shape[1], line_position), (255, 0, 0), 2)
         cv2.putText(frame, f'Count: {total_counts[url_index]}', (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
@@ -215,10 +272,14 @@ def video_feed(url_index):
 def get_cctv_links():
     data = []
     for i, url in enumerate(cctv_urls):
+        # Convert last_time to string if available
+        timestamp_str = last_time[i].strftime("%H:%M:%S") if last_time[i] else "N/A"
+        
         data.append({
             "id": i + 1,
             "link": f"/video_feed/{i}",
-            "totalCount": total_counts[i]
+            "totalCount": total_counts[i],
+            "timestamp": timestamp_str
         })
     return jsonify({"data": data})
 
